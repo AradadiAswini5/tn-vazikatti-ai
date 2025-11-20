@@ -356,7 +356,7 @@ with col1:
     # initialize session state
     if "history" not in st.session_state:
         st.session_state.history = []  # list of (user, bot, sources)
-    st.header("Ask about TN Government")
+    st.header("Ask about TN Government Services")
     query = st.text_input("Type your question here and press Enter", key="query_input")
     if st.button("Send") or (query and st.session_state.get("last_query") != query):
         if query:
