@@ -1,13 +1,15 @@
-
-############################################################
-# TN VAZIKATTI AI — FINAL CLEAN STREAMLIT APP (RAG + GROQ)
-############################################################
+# streamlit_app.py
+# TN Vazikatti AI — Redesigned modern UI + RAG backend (FAISS + HF embeddings + Groq)
+# Paste this entire file and run with: streamlit run streamlit_app.py
 
 import os
 import json
 import re
+import datetime
 from pathlib import Path
 from io import BytesIO
+import textwrap
+import base64
 
 import streamlit as st
 import faiss
@@ -20,26 +22,19 @@ from openai import OpenAI
 import pdfplumber
 import docx
 from bs4 import BeautifulSoup
-import requests
 
-############################################################
-# FIX NLTK PUNKT (Needed for Streamlit Cloud)
-############################################################
+# NLTK punkt fix for cloud
 import nltk
 try:
     nltk.data.find("tokenizers/punkt")
 except LookupError:
     nltk.download("punkt")
 
-try:
-    nltk.data.find("tokenizers/punkt_tab")
-except LookupError:
-    nltk.download("punkt_tab")
+from nltk.tokenize import sent_tokenize
 
-
-############################################################
-# PATHS / DIRECTORIES
-############################################################
+# ---------------------------
+# Paths & config
+# ---------------------------
 DATA_RAW = Path("tn_docs_raw")
 TEXT_DIR = Path("tn_texts")
 INDEX_DIR = Path("faiss_index")
@@ -51,28 +46,23 @@ INDEX_DIR.mkdir(exist_ok=True)
 FAISS_INDEX_FILE = INDEX_DIR / "tn_faiss.index"
 META_FILE = INDEX_DIR / "tn_meta.json"
 
-############################################################
-# MODELS
-############################################################
 EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
-LLM_MODEL = "openai/gpt-oss-120b"   # Groq free model
+LLM_MODEL = "openai/gpt-oss-120b"
 
-
-############################################################
-# TEXT EXTRACTION HELPERS
-############################################################
+# ---------------------------
+# Text extraction helpers
+# ---------------------------
 def extract_text_from_pdf_bytes(b: bytes):
-    text_parts = []
     try:
+        text_parts = []
         with pdfplumber.open(BytesIO(b)) as pdf:
             for page in pdf.pages:
                 txt = page.extract_text()
                 if txt:
                     text_parts.append(txt)
+        return "\n".join(text_parts).strip()
     except Exception:
         return ""
-    return "\n".join(text_parts).strip()
-
 
 def extract_text_from_docx_bytes(b: bytes):
     try:
@@ -82,30 +72,26 @@ def extract_text_from_docx_bytes(b: bytes):
     except Exception:
         return ""
 
-
 def extract_text_from_html_string(html):
     soup = BeautifulSoup(html, "html.parser")
     for s in soup(["script", "style", "noscript"]):
         s.extract()
-    parts = soup.find_all(["p", "li", "h1", "h2", "h3"])
+    parts = soup.find_all(["p","li","h1","h2","h3"])
     return "\n".join([p.get_text(" ", strip=True) for p in parts])
 
-
 def clean_text(text):
-    text = text.replace("\r", " ").replace("\t", " ")
+    text = text.replace("\r"," ").replace("\t"," ")
     text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"Page\s*\d+", "", text)
+    text = re.sub(r"Page\s*\d+", "", text, flags=re.I)
     return text.strip()
 
-
-############################################################
-# SAVE + EXTRACT
-############################################################
+# ---------------------------
+# Save + extract files
+# ---------------------------
 def save_uploaded_file(uploaded_file):
-    path = DATA_RAW / uploaded_file.name
-    path.write_bytes(uploaded_file.getvalue())
-    return path
-
+    out = DATA_RAW / uploaded_file.name
+    out.write_bytes(uploaded_file.getvalue())
+    return out
 
 def extract_and_save_text_from_file(path: Path):
     ext = path.suffix.lower()
@@ -115,292 +101,472 @@ def extract_and_save_text_from_file(path: Path):
         elif ext == ".docx":
             txt = extract_text_from_docx_bytes(path.read_bytes())
         elif ext in [".html", ".htm"]:
-            txt = extract_text_from_html_string(path.read_text("utf-8", errors="ignore"))
+            txt = extract_text_from_html_string(path.read_text(encoding="utf-8", errors="ignore"))
         elif ext == ".txt":
-            txt = path.read_text("utf-8", errors="ignore")
+            txt = path.read_text(encoding="utf-8", errors="ignore")
         else:
             txt = ""
-
     except Exception:
         txt = ""
-
     if not txt or len(txt.strip()) < 20:
         return None
-
     txt = clean_text(txt)
-    out_txt = TEXT_DIR / (path.stem + ".txt")
-    out_txt.write_text(txt, encoding="utf-8")
-    return out_txt
+    out_name = TEXT_DIR / (path.stem + ".txt")
+    out_name.write_text(txt, encoding="utf-8")
+    return out_name
 
-
-############################################################
-# CHUNKING
-############################################################
-from nltk.tokenize import sent_tokenize
-
-def chunk_text_by_sentences(text, max_tokens=180, overlap_sentences=1):
-    sentences = sent_tokenize(text)
+# ---------------------------
+# Chunking
+# ---------------------------
+def chunk_text_by_sentences(text, max_tokens=220, overlap_sentences=1):
+    sents = sent_tokenize(text)
     chunks = []
-    current = []
-    length = 0
-
-    for s in sentences:
+    cur = []
+    cur_len = 0
+    for s in sents:
         words = s.split()
-        if length + len(words) > max_tokens and current:
-            chunks.append(" ".join(current))
-            current = current[-overlap_sentences:] if overlap_sentences else []
-            length = sum(len(x.split()) for x in current)
-
-        current.append(s)
-        length += len(words)
-
-    if current:
-        chunks.append(" ".join(current))
-
+        if cur_len + len(words) > max_tokens and cur:
+            chunks.append(" ".join(cur).strip())
+            cur = cur[-overlap_sentences:] if overlap_sentences>0 else []
+            cur_len = sum(len(x.split()) for x in cur)
+        cur.append(s)
+        cur_len += len(words)
+    if cur:
+        chunks.append(" ".join(cur).strip())
     return chunks
 
-
-############################################################
-# EMBEDDINGS (HuggingFace)
-############################################################
+# ---------------------------
+# Embeddings (HF)
+# ---------------------------
 @st.cache_resource(show_spinner=False)
 def load_embed_model():
     return SentenceTransformer(EMBED_MODEL_NAME)
 
-
-def embed_texts(texts):
+def embed_texts(texts, batch_size=32):
     model = load_embed_model()
-    vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, batch_size=batch_size)
     return vecs.astype("float32")
 
-
-############################################################
-# FAISS INDEX
-############################################################
+# ---------------------------
+# FAISS index build / load
+# ---------------------------
 def build_faiss_index(docs, metas):
     vecs = embed_texts(docs)
-    dim = vecs.shape[1]
-
-    index = faiss.IndexFlatIP(dim)
+    d = vecs.shape[1]
+    index = faiss.IndexFlatIP(d)
     index.add(vecs)
-
     faiss.write_index(index, str(FAISS_INDEX_FILE))
-    META_FILE.write_text(json.dumps({"docs": docs, "meta": metas}, ensure_ascii=False, indent=2))
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump({"docs": docs, "meta": metas}, f, ensure_ascii=False, indent=2)
     return index
-
 
 def load_faiss_index():
     if FAISS_INDEX_FILE.exists() and META_FILE.exists():
-        return faiss.read_index(str(FAISS_INDEX_FILE)), json.load(open(META_FILE, encoding="utf-8"))
+        index = faiss.read_index(str(FAISS_INDEX_FILE))
+        meta = json.load(open(META_FILE, encoding="utf-8"))
+        return index, meta
     return None, None
 
-
-############################################################
-# RETRIEVAL
-############################################################
+# ---------------------------
+# Retrieval
+# ---------------------------
 def retrieve(query, k=4):
     index, meta = load_faiss_index()
     if index is None:
         return []
-
-    q_vec = embed_texts([query])
-    D, I = index.search(q_vec, k)
-
+    qv = embed_texts([query])
+    D, I = index.search(qv, k)
     results = []
     for idx in I[0]:
         if idx < 0 or idx >= len(meta["docs"]):
             continue
         results.append({
             "text": meta["docs"][idx],
-            "source": meta["meta"][idx]["source_file"]
+            "source": meta["meta"][idx].get("source_file","")
         })
     return results
 
-
-############################################################
-# GROQ CLIENT
-############################################################
+# ---------------------------
+# GROQ client init
+# ---------------------------
 @st.cache_resource(show_spinner=False)
 def get_groq_client():
     key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
     if not key:
-        st.error("❌ ERROR: GROQ_API_KEY not set.")
+        st.error("GROQ_API_KEY not set. Add it to Streamlit Secrets.")
         return None
+    client = OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
+    return client
 
-    return OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
+# ---------------------------
+# Prompt & LLM
+# ---------------------------
+def is_small_talk(text):
+    t = text.lower().strip()
+    greetings = ["hi","hello","hey","vanakkam","thanks","thank you"]
+    return t in greetings or any(g in t for g in greetings)
 
-
-############################################################
-# PROMPT GENERATION
-############################################################
-def build_prompt(query, ctx):
-    context_text = "\n\n".join([c["text"] for c in ctx])
-
-    return f"""
+def build_prompt(query, context_chunks):
+    context_text = "\n\n".join([c["text"] for c in context_chunks]) if context_chunks else ""
+    prompt = f"""You are a Tamil Nadu Government Assistant.
 Context:
 {context_text}
 
-User Question: {query}
+User Question:
+{query}
 
 Instructions:
-1. First answer in **English**.
-2. Then give the **same answer in Tamil**.
-3. If answer not found, say:
+1) First answer in clear ENGLISH using ONLY the context above.
+2) Then provide the SAME answer in clear TAMIL.
+3) If the context does NOT contain the answer, reply:
    English: "Information not available."
    Tamil: "தகவல் கிடைக்கவில்லை."
 
 Answer:
 """
-
-
-def is_small_talk(q):
-    q = q.lower().strip()
-    greetings = ["hi", "hello", "hey", "vanakkam"]
-    return q in greetings or any(g in q for g in greetings)
-
+    return prompt
 
 def generate_with_groq(prompt):
     client = get_groq_client()
     if client is None:
-        return "LLM not ready."
-
+        return "LLM client not configured."
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[
-            {"role": "system", "content": "You are a helpful Tamil Nadu Government Assistant."},
-            {"role": "user", "content": prompt}
+            {"role":"system","content":"You are a helpful Tamil Nadu Government Assistant."},
+            {"role":"user","content":prompt}
         ],
         max_tokens=600
     )
     return resp.choices[0].message.content
 
-
 def tn_answer(query):
     if is_small_talk(query):
-        return generate_with_groq(f"Respond politely in English and Tamil: {query}"), []
-
+        return generate_with_groq(f"Respond in English and Tamil, politely, to: {query}"), []
     ctx = retrieve(query, k=4)
     prompt = build_prompt(query, ctx)
     answer = generate_with_groq(prompt)
     return answer, ctx
 
-
-############################################################
-# STREAMLIT UI  — BEAUTIFUL MODERN CHAT GPT STYLE
-############################################################
+# ---------------------------
+# UI - final redesigned
+# ---------------------------
 st.set_page_config(page_title="TN Vazikatti AI", layout="wide")
 
-# ===== CSS =====
+# CSS + background image + emojis + avatars
 st.markdown("""
 <style>
-body { background: #eef2ff; }
+:root{
+  --accent:#0b67ff;
+  --bg1: linear-gradient(180deg, #e6f0ff 0%, #ffffff 60%);
+}
+html, body, [data-testid="stAppViewContainer"] {
+  background: var(--bg1);
+}
+.app-shell {
+  padding-top: 18px;
+}
+.header {
+  display: flex;
+  gap: 16px;
+  align-items:center;
+}
+.header .logo {
+  width:72px;
+  height:72px;
+  border-radius:18px;
+  background: linear-gradient(135deg,#0b67ff,#60a5fa);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  color:white;
+  font-weight:700;
+  font-size:34px;
+  box-shadow: 0 6px 18px rgba(11,103,255,0.18);
+}
+.header h1 { margin:0; font-size:22px; color:#063069; }
+.header p { margin:0; color:#475569; }
 
-.chat-box {
-  background: white;
-  padding: 28px;
-  border-radius: 25px;
-  width: 100%;
-  max-width: 700px;
-  margin: auto;
-  box-shadow: 0 6px 18px rgba(0,0,0,0.1);
+/* Chat container */
+.container {
+  max-width:980px;
+  margin: 12px auto 60px;
+  display: grid;
+  grid-template-columns: 1fr 360px;
+  gap: 20px;
+  align-items:start;
 }
 
-.message-user {
-  background: #2563eb;
+/* left chat card */
+.chat-card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.95), rgba(250,250,255,0.95));
+  border-radius:18px;
+  padding:18px;
+  box-shadow: 0 8px 30px rgba(9,30,66,0.06);
+}
+
+/* make chat area smaller height */
+.chat-area {
+  max-height: 620px;
+  overflow:auto;
+  padding: 12px;
+  border-radius:12px;
+  border: 1px solid rgba(15,23,42,0.04);
+  background: linear-gradient(180deg,#ffffff,#fbfdff);
+}
+
+/* bubbles */
+.bubble-user {
+  background: var(--accent);
   color: white;
-  padding: 12px 18px;
-  border-radius: 16px;
-  margin: 10px 0;
-  text-align:right;
+  padding: 10px 14px;
+  border-radius: 18px 18px 6px 18px;
+  display: inline-block;
+  margin: 8px 2px;
+  max-width:78%;
+  word-wrap:break-word;
+  float:right;
+  clear:both;
+}
+.bubble-bot {
+  background: #f6f9ff;
+  color: #0b1a33;
+  padding: 10px 14px;
+  border-radius: 18px 18px 18px 6px;
+  display: inline-block;
+  margin: 8px 2px;
+  max-width:78%;
+  word-wrap:break-word;
+  float:left;
+  clear:both;
+  border: 1px solid rgba(11,103,255,0.06);
 }
 
-.message-bot {
-  background: #f3f4f6;
-  color: #111827;
-  padding: 12px 18px;
-  border-radius: 16px;
-  margin: 10px 0;
-  text-align:left;
+/* little meta */
+.meta { font-size:12px; color:#6b7280; margin-top:6px; }
+
+/* input area - floating feel */
+.input-area {
+  display:flex;
+  gap:10px;
+  margin-top:12px;
+  align-items:center;
+}
+.input-area textarea {
+  flex:1;
+  border-radius:12px;
+  border:1px solid rgba(15,23,42,0.06);
+  padding:10px 12px;
+  min-height:44px;
+  font-size:14px;
+  resize:none;
+}
+.send-btn {
+  background: var(--accent);
+  color:white;
+  padding:10px 16px;
+  border-radius:12px;
+  border:none;
+  cursor:pointer;
+}
+.send-btn:active { transform: translateY(1px); }
+.small {
+  font-size:13px;
+  color:#475569;
 }
 
+/* sidebar */
+.side-card {
+  background: white;
+  padding:16px;
+  border-radius:12px;
+  box-shadow: 0 6px 18px rgba(9,30,66,0.04);
+}
+
+/* typing indicator */
+.typing {
+  display:inline-block;
+  width: 44px;
+  text-align:center;
+}
+.dot {
+  height:8px; width:8px; margin:0 2px; display:inline-block; border-radius:50%; background:#90caf9; animation: blink 1s infinite;
+}
+.dot:nth-child(2){ animation-delay:0.15s;}
+.dot:nth-child(3){ animation-delay:0.3s;}
+@keyframes blink {
+  0%,80%,100%{opacity:0.2}
+  40%{opacity:1}
+}
+
+/* badges / emoji */
+.badge { font-size:14px; padding:6px 10px; border-radius:999px; background:#eef2ff; color:#0b67ff; border:1px solid rgba(11,103,255,0.06); }
+
+/* clear floats */
+.clearfix::after { content:""; clear:both; display:block; }
 </style>
 """, unsafe_allow_html=True)
 
-col1, col2 = st.columns([3, 1])
+# Top header
+st.markdown("""
+<div class="header">
+  <div class="logo">TN</div>
+  <div>
+    <h1>TN Vazikatti AI <span class="small">— Tamil Nadu Government Services</span></h1>
+    <p class="small">Ask about services in English or Tamil • Powered by FAISS + Groq + HF embeddings</p>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
+# layout container
+st.markdown("<div class='container'>", unsafe_allow_html=True)
 
-############################################################
-# SIDEBAR (Upload + Build Index)
-############################################################
-with col2:
-    st.title("TN Vazikatti AI")
-    st.write("**Tamil Nadu Government Assistant**")
-    st.write("---")
+# ---------------------------
+# Left: Chat area
+# ---------------------------
+st.markdown("<div class='chat-card'>", unsafe_allow_html=True)
+st.markdown("<div class='chat-area' id='chat-area'>", unsafe_allow_html=True)
 
-    index, meta = load_faiss_index()
-    if index is None:
-        st.error("FAISS index not available.")
+# initialize
+if "history" not in st.session_state:
+    st.session_state.history = []  # list of (user, bot, sources)
+
+# render messages
+for user_text, bot_text, sources in st.session_state.history:
+    # user bubble
+    st.markdown(f"<div class='bubble-user'>{user_text}</div>", unsafe_allow_html=True)
+    # bot bubble (allow markup)
+    safe_bot = bot_text.replace("\n","<br>")
+    st.markdown(f"<div class='bubble-bot'>{safe_bot}</div>", unsafe_allow_html=True)
+    if sources:
+        st.markdown(f"<div class='meta'>Sources: {', '.join(sources)}</div>", unsafe_allow_html=True)
+    st.markdown("<div class='clearfix'>&nbsp;</div>", unsafe_allow_html=True)
+
+st.markdown("</div>", unsafe_allow_html=True)  # end chat-area
+
+# input area (floating)
+st.markdown("""
+<div class="input-area">
+  <textarea id="user_input" placeholder="Type your question here (English / Tamil)"></textarea>
+  <button class="send-btn" id="send_btn">➤</button>
+</div>
+<script>
+const sendBtn = document.getElementById('send_btn');
+const input = document.getElementById('user_input');
+sendBtn.onclick = () => {
+  const val = input.value;
+  if (!val) return;
+  // use Streamlit setComponentValue via form submit fallback:
+  const el = document.createElement('a');
+  el.href='/?_send='+encodeURIComponent(val);
+  el.click();
+};
+</script>
+""", unsafe_allow_html=True)
+
+# small helpers: capture GET param _send (when clicking send button)
+query_from_front = None
+params = st.experimental_get_query_params()
+if "_send" in params:
+    q = params["_send"][0]
+    query_from_front = q
+
+# old fallback text_input for browsers without JS
+fallback = st.text_input("or type here and press Send", key="fallback_input")
+if fallback and st.button("Send (fallback)"):
+    query_from_front = fallback
+
+# process query if provided
+if query_from_front:
+    q = query_from_front.strip()
+    if q:
+        st.session_state.history.append((q, "…", []))
+        st.rerun()
+
+# If last appended is placeholder '…' we will generate reply
+# generate replies for any placeholder entries
+updated = False
+for i,(u,b,s) in enumerate(st.session_state.history):
+    if b == "…":
+        # call model
+        with st.spinner("Vazikatti is typing..."):
+            ans, ctx = tn_answer(u)
+        sources = list({c["source"] for c in ctx}) if ctx else []
+        st.session_state.history[i] = (u, ans, sources)
+        updated = True
+
+if updated:
+    st.rerun()
+
+# small area: download chat
+def get_chat_text():
+    txt = ""
+    for u,b,s in st.session_state.history:
+        txt += f"USER: {u}\nBOT:\n{b}\n"
+        if s:
+            txt += f"SOURCES: {', '.join(s)}\n"
+        txt += "\n---\n\n"
+    return txt
+
+st.markdown("<div style='margin-top:12px; display:flex; gap:8px; align-items:center;'>", unsafe_allow_html=True)
+if st.button("💾 Download Chat (TXT)"):
+    content = get_chat_text()
+    b64 = base64.b64encode(content.encode()).decode()
+    href = f'<a href="data:file/text;base64,{b64}" download="tn_vazikatti_chat_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.txt">Click to download</a>'
+    st.markdown(href, unsafe_allow_html=True)
+
+# optionally provide JSON download
+if st.button("📁 Save as JSON"):
+    fname = f"chat_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump([{"user":u,"bot":b,"sources":s} for u,b,s in st.session_state.history], f, ensure_ascii=False, indent=2)
+    st.success(f"Saved {fname}")
+
+st.markdown("</div>", unsafe_allow_html=True)  # end input area
+st.markdown("</div>", unsafe_allow_html=True)  # end chat-card
+
+# ---------------------------
+# Right: Sidebar card (upload + index)
+# ---------------------------
+st.markdown("<div class='side-card'>", unsafe_allow_html=True)
+
+st.markdown("<h3 style='margin-top:0;'>Index & Upload</h3>", unsafe_allow_html=True)
+index, meta = load_faiss_index()
+if index is None:
+    st.error("FAISS index not loaded. Upload docs & click Build.")
+else:
+    st.success(f"Index loaded — {len(meta['docs'])} chunks")
+
+uploaded = st.file_uploader("Upload documents (.pdf, .txt, .docx, .html)", accept_multiple_files=True)
+if uploaded:
+    for f in uploaded:
+        p = save_uploaded_file(f)
+        saved = extract_and_save_text_from_file(p)
+        st.write(f"Saved: {saved.name if saved else 'Extraction failed'}")
+
+if st.button("Build / Rebuild Index"):
+    st.info("Extracting and chunking documents...")
+    raw_files = sorted(DATA_RAW.glob("*"))
+    for p in raw_files:
+        extract_and_save_text_from_file(p)
+    docs = []
+    metas = []
+    for txtfile in sorted(TEXT_DIR.glob("*.txt")):
+        txt = txtfile.read_text(encoding="utf-8", errors="ignore")
+        chunks = chunk_text_by_sentences(txt, max_tokens=220, overlap_sentences=1)
+        for i,ch in enumerate(chunks):
+            docs.append(ch)
+            metas.append({"source_file": txtfile.name, "chunk_id": f"{txtfile.stem}__{i}"})
+    if not docs:
+        st.warning("No text chunks found.")
     else:
-        st.success(f"Index Loaded ({len(meta['docs'])} chunks)")
+        st.info("Building FAISS (this may take a while)...")
+        build_faiss_index(docs, metas)
+        st.success(f"Index built with {len(docs)} chunks")
 
-    uploaded = st.file_uploader("Upload docs (.pdf, .txt, .html, .docx)", accept_multiple_files=True)
-    if uploaded:
-        for f in uploaded:
-            raw_path = save_uploaded_file(f)
-            saved = extract_and_save_text_from_file(raw_path)
-            st.write(saved.name if saved else "Extraction failed")
+st.markdown("<hr>", unsafe_allow_html=True)
+st.markdown("<div class='small'>Model: " + LLM_MODEL + "</div>", unsafe_allow_html=True)
+st.markdown("<div style='margin-top:8px;'><span class='badge'>English + Tamil</span>  <span style='margin-left:8px' class='small'>FAQ • Upload docs • Build index</span></div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)  # end side-card
 
-    if st.button("Build / Rebuild Index"):
-        st.info("Extracting documents...")
-        raw_files = DATA_RAW.glob("*")
-        for p in raw_files:
-            extract_and_save_text_from_file(p)
-
-        st.info("Chunking...")
-        docs = []
-        metas = []
-        for txt in TEXT_DIR.glob("*.txt"):
-            content = txt.read_text("utf-8", errors="ignore")
-            chunks = chunk_text_by_sentences(content)
-            for i, ch in enumerate(chunks):
-                docs.append(ch)
-                metas.append({"source_file": txt.name, "chunk_id": f"{txt.stem}_{i}"})
-
-        if docs:
-            st.info("Building FAISS...")
-            build_faiss_index(docs, metas)
-            st.success("Index built!")
-
-    st.write("---")
-    st.caption("Add docs → Build index → Chat")
-
-
-############################################################
-# MAIN CHAT UI
-############################################################
-with col1:
-    st.markdown("""
-        <div style='text-align:center; padding:20px 0;'>
-            <h1>TN Vazikatti AI</h1>
-            <p style='font-size:18px; color:#4b5563;'>Ask anything about Tamil Nadu Government Services</p>
-        </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("<div class='chat-box'>", unsafe_allow_html=True)
-
-    if "history" not in st.session_state:
-        st.session_state.history = []
-
-    for user_msg, bot_msg, _ in st.session_state.history:
-        st.markdown(f"<div class='message-user'>{user_msg}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='message-bot'>{bot_msg.replace('\\n','<br>')}</div>", unsafe_allow_html=True)
-
-    user_query = st.text_input("Type your message...")
-    if st.button("Send"):
-        if user_query.strip():
-            with st.spinner("Thinking..."):
-                ans, ctx = tn_answer(user_query)
-            st.session_state.history.append((user_query, ans, ctx))
-            st.rerun()
-
-    st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)  # end container
