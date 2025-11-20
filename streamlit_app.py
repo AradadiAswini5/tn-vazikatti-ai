@@ -1,3 +1,4 @@
+
 ############################################################
 # TN VAZIKATTI AI — FINAL CLEAN STREAMLIT APP (RAG + GROQ)
 ############################################################
@@ -400,6 +401,6 @@ with col1:
             with st.spinner("Thinking..."):
                 ans, ctx = tn_answer(user_query)
             st.session_state.history.append((user_query, ans, ctx))
-            st.experimental_rerun()
+            st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
